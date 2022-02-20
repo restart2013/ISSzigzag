@@ -1,0 +1,165 @@
+### control variates 的 importance sub-sampling算法
+### 与 uncontrol variates 进行比较
+### 该文件中的内容是对论文4.2节的复现
+###
+### 本文件提供了control variates 的 importance sub-sampling zigzag process代码
+### 并比较了与uncontrol variates 情况下的efficiency
+### 涉及论文补充材料S3的部分
+### 
+### 由于本文件是对control和uncontrol两种方法比较的复现，
+### control variates 的 importance sub-sampling zigzag process代码部分将会单独放在
+### 4.2控制变量.txt中,方便使用
+### 若仅想查看control variates 的 importance sub-sampling算法请直接前往txt
+### 
+### 本txt只提供control variates 的 importance sub-sampling算法代码
+### 论文4.2的整体实验复现在对应的R文件中
+###
+###
+######################以下为代码部分#######################
+library(stats4)
+library(splines)
+library(VGAM)
+library(matrixStats)
+
+set.seed(114514)
+# x维度10，样本量5000
+p = 10
+n = 5000
+
+# xi真值
+xi_true <- rep(-1,p)
+
+# x和y
+# 混合分布(1-alpha)0 + alpha标准正态 ，alpha=0.1
+alpha = 0.1
+# 从混合分布中抽取500个x
+x <- array( rlaplace(p*n,0,1) ,dim=c(p,n))
+a <- array( as.integer(runif(p*n,0,1) < alpha) ,dim=c(p,n))
+x <- x*a
+# 根据xi真值产生逻辑回归y
+y <- as.integer( runif(n,0,1) < 1/(1+exp(-xi_true%*%x)) )
+
+
+# xi先验初值
+xi <- rnorm(p,0,1)
+xi_star <- rnorm(p,0,1)
+# xi先验分布为正态N(0,sigma^2)，sigma=10^5
+sigma <- 1
+
+# 函数定义
+# 抽取反弹时间t，mi_o部分
+generate_t_mi_o <- function(unif,xi){
+  unif <- -log(unif)
+  t <- (sqrt(unif+abs(xi))-sqrt(abs(xi)))*sqrt(2*sigma^2)
+  return(t)
+}
+
+# 抽取反弹时间t，mi_*部分控制变量
+generate_t_mi_c <- function(unif,x,y,xi,theta){
+  unif <- -log(unif)
+  A <- 1/4*colSums(t(abs(x))*sqrt(colSums(x^2)))*sqrt(p)
+  B <- theta*colSums(t(x)*as.vector(exp(t(x)%*%xi_star)/(1+exp(t(x)%*%xi_star)))-y*t(x))
+  B <- rowMaxs(cbind(rep(0,p),B))+1/4*colSums(t(abs(x))*sqrt(colSums(x^2)))*sqrt(sum((xi-xi_star)^2))
+  C <- B/(2*sqrt(A))
+  t <- (sqrt(unif+C^2)-C)/A
+  return(t)
+}
+# rate函数mi_o
+mi_o <- function(theta,xi,i){
+  mi <- theta[i]*xi[i]/(sigma^2)
+  return(max(0,mi))
+}
+# mi_o上界
+Mi_o <- function(xi,i,t){
+  Mi <- (abs(xi[i])+t)/sigma^2
+  return(Mi)
+}
+
+# rate函数mi_*控制变量
+mi_c <- function(theta,y,x,xi,i,B){
+  mi <- 0
+  for (b in 1:B){
+    j <- sample(1:n,1,prob=abs(x[i,])*sqrt(colSums(x^2)))
+    y_ <- y[j]
+    x_ <- x[,j]
+    mi_ <- x_[i]*exp(x_%*%xi)/(1+exp(x_%*%xi))-y_*x_[i]
+    mi_star <- x_[i]*exp(x_%*%xi_star)/(1+exp(x_%*%xi_star))-y_*x_[i]
+    mi <- mi+sum(abs(x[i,])*sqrt(colSums(x^2)))/(abs(x[i,])*sqrt(colSums(x^2)))[j]*(mi_-mi_star)
+  }
+  mi <- mi/B + sum(x[i,]*exp(t(x)%*%xi_star)/(1+exp(t(x)%*%xi_star))-y*x[i,])
+  return(max(0,theta[i]*mi))
+}
+
+# mi_*上界控制变量
+Mi_c <- function(x,y,theta,i,xi,t){
+  Mi <- theta[i]*sum(x[i,]*exp(t(x)%*%xi_star)/(1+exp(t(x)%*%xi_star))-y*x[i,])
+  Mi <- max(0,Mi)+1/4*sum(abs(x[i,])*sqrt(colSums(x^2)))*(sqrt(sum((xi-xi_star)^2))+t*sqrt(p))
+  return(Mi)
+}
+
+  
+  
+# 控制变量sub-sampling zigzag过程
+# 跑k步
+k = 10^7
+# 初始值
+xi_seq <- array(0,dim=c(p,k))
+xi_seq[,1] <- xi
+t_seq <- vector()
+t_seq[1] <- 0
+  
+# theta初始值
+theta <- rep(1,p)
+  
+# 算法参数mini_batch
+B = 1
+  
+# 记录theta正负号反转次数
+bouncing_time <- 0
+  
+# zigzag
+for (step in 2:k){
+  t_prior <- generate_t_mi_o(runif(p,0,1),xi_seq[,step-1])
+  t_condition <- generate_t_mi_c(runif(p,0,1),x,y,xi_seq[step-1],theta)
+  i_p <- which.min(t_prior)
+  i_c <- which.min(t_condition)
+  if(t_prior[i_p]<t_condition[i_c]){
+    i <- i_p
+    t <- t_prior[i]
+    # 更新序列
+    t_seq[step] <- t_seq[step-1]+t
+    xi_seq[,step] <- xi_seq[,step-1]+t*theta
+    # 更新theta
+    a <- runif(1,0,1)
+    if(a < mi_o(theta,xi_seq[,step],i)/Mi_o(xi_seq[,step-1],i,t) ){
+      theta[i] <- theta[i]*-1
+      bouncing_time <- bouncing_time+1
+    }
+  }else{
+    i <- i_c
+    t <- t_condition[i]
+    # 更新序列
+    t_seq[step] <- t_seq[step-1]+t
+    xi_seq[,step] <- xi_seq[,step-1]+t*theta
+    # 更新theta
+    a <- runif(1,0,1)
+    if(a < mi_c(theta,y,x,xi_seq[,step],i,B)/Mi_c(x,y,theta,i,xi_seq[step-1],t) ){
+      theta[i] <- theta[i]*-1
+      bouncing_time <- bouncing_time+1
+    }
+  }
+  if (bouncing_time == 10^4){
+    # theta正负号反转10^4次后停止
+    break
+  }
+}
+
+print('control variates simulation time:')
+print(max(t_seq))
+print('bouncing time:')
+print(bouncing_time)
+
+# 画图
+# p=10
+plot(xi_seq[1,], type='l')
+abline(h=-1,col='red')
